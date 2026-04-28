@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "parts": [
+    {
+      "type": "board-esp32-devkit-c-v4",
+      "id": "master",
+      "top": 0,
+      "left": 0,
+      "attrs": {}
+    }
+  ],
+  "connections": [
+    ["master:TX", "$serialMonitor:RX", "green", []],
+    ["master:RX", "$serialMonitor:TX", "green", []]
+  ]
+}

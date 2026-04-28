@@ -1,0 +1,77 @@
+# Arduino/ESP32 build artifacts
+*.o
+*.a
+*.elf
+*.bin
+*.hex
+*.map
+*.lst
+*.lss
+*.eep
+*.sym
+*.d
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+lib/
+piolibs/
+
+# Arduino IDE
+*.ino.cpp
+*.ino.globals.h
+
+# VS Code / Visual Studio
+.vscode/
+.vs/
+*.code-workspace
+
+# IDE specific
+.idea/
+*.iml
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Build directories
+build/
+dist/
+*.egg-info/
+
+# Python (if using for testing/tools)
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+env/
+.env
+
+# Logs and temporary files
+*.log
+*.tmp
+*.temp
+debug.log
+
+# OS generated files
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# Credentials and secrets
+secrets.h
+credentials.h
+*.pem
+*.key
+
+# Test outputs
+test_results/
+*.csv
+
+# Wokwi specific (if any local cache)
+.wokwi/
+
+# Documentation builds
+docs/_build/
+site/
