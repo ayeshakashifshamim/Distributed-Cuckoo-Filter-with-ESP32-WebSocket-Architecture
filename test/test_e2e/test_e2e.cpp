@@ -21,7 +21,7 @@ static SlaveStorage  g_storage[NUM_SLAVES];
 static Dispatcher*   g_disp[NUM_SLAVES] = {nullptr};
 static uint8_t       g_route_primary[GLOBAL_BUCKET_COUNT];
 static bool          g_route_locked[GLOBAL_BUCKET_COUNT];
-static bool          g_slave_alive[NUM_SLAVES] = {true, true, true, true};
+static bool          g_slave_alive[NUM_SLAVES] = {};  // test_00 sets all to true
 
 static uint8_t g_reply_status      = 0;
 static uint8_t g_reply_seq         = 0;

@@ -265,6 +265,9 @@ static void unlock_batch(const uint16_t* batch, uint8_t n) {
 }
 
 static void cmd_rebalance() {
+    if (NUM_SLAVES < 2) {
+        Serial.println("[MASTER] REBALANCE: need >=2 slaves"); return;
+    }
     int8_t  src = -1, dst = -1;
     uint8_t max_load = 0, min_load = 101;
     for (uint8_t i = 0; i < NUM_SLAVES; i++) {
@@ -284,11 +287,21 @@ static void cmd_rebalance() {
                   overload ? "overload" : "imbalance",
                   g_slaves[src].id, max_load, g_slaves[dst].id, min_load);
 
-    // Pick up to MAX_BUCKET_BATCH buckets currently owned by src that aren't
-    // already locked by another in-flight operation.
+    // Guard: dst must have free physical slots to receive buckets.
+    uint16_t dst_owned = 0;
+    for (uint16_t b = 0; b < GLOBAL_BUCKET_COUNT; b++)
+        if (g_route_primary[b] == (uint8_t)dst) dst_owned++;
+    if (dst_owned >= LOCAL_CAPACITY) {
+        Serial.println("[MASTER] REBALANCE: dst has no free slots"); return;
+    }
+    uint8_t dst_free = (uint8_t)(LOCAL_CAPACITY - dst_owned);
+
+    // Pick up to MAX_BUCKET_BATCH (and no more than dst_free) buckets currently
+    // owned by src that aren't already locked by another in-flight operation.
     uint16_t batch[MAX_BUCKET_BATCH];
     uint8_t  n = 0;
-    for (uint16_t b = 0; b < GLOBAL_BUCKET_COUNT && n < MAX_BUCKET_BATCH; b++) {
+    uint8_t  cap = (dst_free < MAX_BUCKET_BATCH) ? dst_free : MAX_BUCKET_BATCH;
+    for (uint16_t b = 0; b < GLOBAL_BUCKET_COUNT && n < cap; b++) {
         if (g_route_primary[b] == (uint8_t)src && !g_route_locked[b]) batch[n++] = b;
     }
     if (n == 0) { Serial.println("[MASTER] REBALANCE: no eligible buckets"); return; }
@@ -520,8 +533,18 @@ void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
             }
             // New-node-join may have created an imbalance — flag for the loop.
             g_rebalance_pending = true;
-        } else if (sl->alive && hb->load_pct > REBALANCE_THRESHOLD) {
-            g_rebalance_pending = true;
+        } else if (sl->alive) {
+            if (hb->load_pct > REBALANCE_THRESHOLD) {
+                g_rebalance_pending = true;
+            } else if (NUM_SLAVES >= 2) {
+                uint8_t hi = 0, lo = 101;
+                for (uint8_t i = 0; i < NUM_SLAVES; i++) {
+                    if (!g_slaves[i].alive) continue;
+                    if (g_slaves[i].load_pct > hi) hi = g_slaves[i].load_pct;
+                    if (g_slaves[i].load_pct < lo) lo = g_slaves[i].load_pct;
+                }
+                if (hi - lo >= IMBALANCE_THRESHOLD) g_rebalance_pending = true;
+            }
         }
     }
 }
