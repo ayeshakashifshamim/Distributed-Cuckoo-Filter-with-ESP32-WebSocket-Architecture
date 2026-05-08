@@ -1,7 +1,6 @@
 // test_e2e.cpp
 
-// ISSUES HERE - kabeer
-// ISSUES HAVE BEEN FIXED THE TEST IS WORKING!!!!!
+
 
 // sequential end-to-end coverage for the distributed cuckoo filter.
 // simulates a master and NUM_SLAVES slaves in a single process

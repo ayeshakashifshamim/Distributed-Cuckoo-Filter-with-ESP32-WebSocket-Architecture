@@ -1,3 +1,4 @@
+// Copyright (c) 2026 - Kabeer's Network Opensource Ecosystem
 // slave.cpp — ESP-NOW slave node for distributed cuckoo filter.
 //
 // Responsibilities:

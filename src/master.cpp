@@ -1,3 +1,4 @@
+// Copyright (c) 2026 - Kabeer's Network Opensource Ecosystem 
 // master.cpp — Distributed cuckoo filter coordinator.
 //
 // Responsibilities:
