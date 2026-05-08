@@ -1,7 +1,6 @@
 # Test Matrix — Distributed Cuckoo Filter
 
-## Native Tests (no hardware required)
-
+## No Hardware Tests 
 | Suite | Coverage |
 |---|---|
 | `test_cuckoo_filter` | Single-node filter correctness: insert, lookup, delete, clear, capacity, load % |
