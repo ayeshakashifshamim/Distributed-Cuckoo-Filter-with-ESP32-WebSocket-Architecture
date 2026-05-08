@@ -1,14 +1,11 @@
 #pragma once
-// ─────────────────────────────────────────────────────────────────────────────
-// messages.h — Wire protocol for Distributed Cuckoo Filter (master ↔ slave).
+// wire protocol for Distributed Cuckoo Filter
 //   All structs are 1-byte packed so binary layout is identical on ESP32 and
-//   desktop (native tests). Field order is contract — do not reorder.
-// ─────────────────────────────────────────────────────────────────────────────
+//   desktop. Field order is contract.
+
 #include <stdint.h>
 #include "../config.h"
 
-// ── Message type constants ───────────────────────────────────────────────────
-#define MSG_INSERT              0x01
 #define MSG_DELETE              0x02
 #define MSG_LOOKUP              0x03
 #define MSG_SYNC                0x04
@@ -25,14 +22,12 @@
 #define MSG_BUCKET_BATCH_CLEAR  0x11
 #define MSG_HARD_RESET          0x12
 
-// Command aliases for master/slave command routing.
 #define CMD_PING    MSG_PING
 #define CMD_INSERT  MSG_INSERT
 #define CMD_LOOKUP  MSG_LOOKUP
 #define CMD_DELETE  MSG_DELETE
 #define CMD_STATUS  MSG_SYNC
 
-// ── Status codes (used in MsgAck.status and MsgChainResult.status) ───────────
 #define STATUS_OK          0
 #define STATUS_FULL        1
 #define STATUS_NOT_FOUND   2
@@ -63,12 +58,12 @@ struct __attribute__((packed)) MsgHeader {
     uint16_t dst_id;    // destination node ID (low byte = slave ID or BROADCAST_ID)
 };
 
-// ── User-level operations (master → slave) ──────────────────────────────────
+// User-level operations (master to slave) 
 struct __attribute__((packed)) MsgInsert { MsgHeader hdr; uint8_t item[8]; uint8_t item_len; };
 struct __attribute__((packed)) MsgDelete { MsgHeader hdr; uint8_t item[8]; uint8_t item_len; };
 struct __attribute__((packed)) MsgLookup { MsgHeader hdr; uint8_t item[8]; uint8_t item_len; };
 
-// ── Slave status (slave → master) ────────────────────────────────────────────
+// Slave status (slave to master) 
 struct __attribute__((packed)) MsgSync {
     MsgHeader hdr;
     uint32_t  item_count;
@@ -83,14 +78,14 @@ struct __attribute__((packed)) MsgHeartbeat {
     uint8_t   load_pct;
 };
 
-// ── Acknowledgements ─────────────────────────────────────────────────────────
+// ack
 struct __attribute__((packed)) MsgAck {
     MsgHeader hdr;
     uint8_t   ack_seq;   // mirrors seq from the originating request
     uint8_t   status;    // STATUS_*
 };
 
-// ── Kickout chain (master ↔ slave) ──────────────────────────────────────────
+// Kickout chain 
 // try_only=1 → slave accepts only if a slot is free; returns STATUS_FULL on full
 // try_only=0 → slave evicts a random resident tag on full, returns STATUS_KICKED
 struct __attribute__((packed)) MsgChainInsert {
@@ -110,15 +105,15 @@ struct __attribute__((packed)) MsgChainResult {
     uint8_t   evicted_tag; // valid only when status == STATUS_KICKED
 };
 
-// ── Direct bucket queries (master → slave) ──────────────────────────────────
+// Direct bucket queries (master to slave) 
 struct __attribute__((packed)) MsgTagQuery {
     MsgHeader hdr;     // type = MSG_TAG_LOOKUP or MSG_TAG_DELETE
     uint16_t  bucket;
     uint8_t   tag;
 };
 
-// ── Bucket migration (rebalancing, 3 round trips per batch) ─────────────────
-// Sizes at MAX_BUCKET_BATCH = 20 stay under the 250-byte ESP-NOW limit.
+// Bucket migration (rebalancing, 3 round trips per batch) 
+// Sizes at MAX_BUCKET_BATCH = 20 stay under the 250-byte ESP-NOW limit
 struct __attribute__((packed)) BucketEntry {
     uint16_t global_bucket;
     uint8_t  tags[4];  // must match CF_BUCKET_SIZE
@@ -148,7 +143,7 @@ struct __attribute__((packed)) MsgBucketBatchClear {
     uint16_t  buckets[MAX_BUCKET_BATCH];
 };
 
-// ── Hard reset (master → slave on reconnect with non-zero load) ─────────────
+// Hard reset (master to slave on reconnect with non-zero load) 
 struct __attribute__((packed)) MsgHardReset {
     MsgHeader hdr;
 };
