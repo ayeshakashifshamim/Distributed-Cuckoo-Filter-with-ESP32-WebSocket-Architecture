@@ -1,10 +1,13 @@
-// test_e2e — sequential end-to-end coverage for the distributed cuckoo filter.
-//
-// Simulates a master and NUM_SLAVES slaves in a single process. Each slave owns
-// a SlaveStorage + Dispatcher pair; the "transport" is a function-pointer hack
-// that steers slave replies back into the test harness's reply collectors.
-//
-// Tests are ordered: each case builds on the state left by previous cases.
+// test_e2e.cpp
+
+// ISSUES HERE - kabeer
+// ISSUES HAVE BEEN FIXED THE TEST IS WORKING!!!!!
+
+// sequential end-to-end coverage for the distributed cuckoo filter.
+// simulates a master and NUM_SLAVES slaves in a single process
+// SlaveStorage + Dispatcher pair - the "transport" is a function-pointer hack
+// that steers slave replies back into the test harness's reply collectors
+// tests are ordered. DONT CHANGE THE ORDER AS THEY AARE DEPENDANT. ok
 
 #include <unity.h>
 #include <string.h>
@@ -15,13 +18,13 @@
 #include "slave_storage.h"
 #include "dispatcher/dispatcher.h"
 
-// ─── Simulated cluster ─────────────────────────────────────────────────────
 
+// simulated cluster
 static SlaveStorage  g_storage[NUM_SLAVES];
 static Dispatcher*   g_disp[NUM_SLAVES] = {nullptr};
 static uint8_t       g_route_primary[GLOBAL_BUCKET_COUNT];
 static bool          g_route_locked[GLOBAL_BUCKET_COUNT];
-static bool          g_slave_alive[NUM_SLAVES] = {};  // test_00 sets all to true
+static bool          g_slave_alive[NUM_SLAVES] = {};  // test_00 - sets all to true
 
 static uint8_t g_reply_status      = 0;
 static uint8_t g_reply_seq         = 0;
@@ -33,7 +36,7 @@ static bool               g_batch_data_ready = false;
 
 static uint8_t g_active_slave = 0;
 
-// Slave-side transport: routed by g_active_slave (set by deliver()).
+// slave-side transport: routed by g_active_slave (set by deliver()).
 static void transport_from_slave(const uint8_t* data, size_t len) {
     (void)len;
     uint8_t type = data[0];
@@ -62,7 +65,7 @@ static void deliver(uint8_t idx, const void* buf, size_t len) {
     g_disp[idx]->onMessage((const uint8_t*)buf, len);
 }
 
-// ─── Master-side helpers (mirror master.cpp) ───────────────────────────────
+// Master-side helpers
 
 static uint8_t  g_seq = 0;
 static uint32_t g_op_id = 1;
@@ -190,14 +193,13 @@ static uint8_t delete_key(const uint8_t* key, uint8_t key_len) {
     return any_unavailable ? STATUS_UNAVAILABLE : STATUS_NOT_FOUND;
 }
 
-// ─── Test fixture ───────────────────────────────────────────────────────────
+// test fixture
 
 void setUp() {}
 void tearDown() {}
 
-// ─── Tests (run in order) ───────────────────────────────────────────────────
 
-// 0. Boot — routing table is b % NUM_SLAVES, every slave clean.
+// a. Boot — routing table is b % NUM_SLAVES, every slave clean.
 void test_00_routing_and_storage_init() {
     for (uint8_t i = 0; i < NUM_SLAVES; i++) {
         g_storage[i].init();
@@ -223,7 +225,7 @@ void test_00_routing_and_storage_init() {
     }
 }
 
-// 1. Single insert lands, looks up, deletes.
+// b. Single insert lands, looks up, deletes.
 void test_01_insert_lookup_delete() {
     const char* k = "alpha";
     TEST_ASSERT_EQUAL(STATUS_OK, insert_key((const uint8_t*)k, 5));
@@ -232,7 +234,7 @@ void test_01_insert_lookup_delete() {
     TEST_ASSERT_EQUAL(STATUS_NOT_FOUND, lookup_key((const uint8_t*)k, 5));
 }
 
-// 2. Many distinct keys insert + lookup.
+// c. Many distinct keys insert + lookup.
 void test_02_many_inserts_and_lookups() {
     const uint32_t N = 200;
     for (uint32_t i = 0; i < N; i++) {
@@ -244,7 +246,7 @@ void test_02_many_inserts_and_lookups() {
     for (uint32_t i = 0; i < N; i++) delete_key((const uint8_t*)&i, sizeof(i));
 }
 
-// 3. try_only=true returns STATUS_FULL on full bucket without evicting.
+// d. try_only=true returns STATUS_FULL on full bucket without evicting.
 void test_03_try_only_does_not_evict() {
     srand(1);
     const uint16_t target = 7;
@@ -281,7 +283,7 @@ void test_03_try_only_does_not_evict() {
     TEST_ASSERT_EQUAL(STATUS_OK, g_reply_status);
 }
 
-// 4. Dedup: replaying a CHAIN_INSERT with the same seq gives identical reply.
+// e. Dedup: replaying a CHAIN_INSERT with the same seq gives identical reply.
 void test_04_dedup_replays_cached_result() {
     const uint16_t b = 3;
     const uint8_t owner = g_route_primary[b];
@@ -310,7 +312,7 @@ void test_04_dedup_replays_cached_result() {
     TEST_ASSERT_EQUAL(1, count);
 }
 
-// 5. Bucket batch round trip: read → write on another slave → clear on source.
+// f. Bucket batch round trip: read → write on another slave → clear on source.
 void test_05_bucket_batch_migration() {
     const uint16_t buckets[3] = {0, NUM_SLAVES, NUM_SLAVES * 2};  // owned by slave 0
     for (uint8_t i = 0; i < 3; i++) TEST_ASSERT_EQUAL(0, g_route_primary[buckets[i]]);
@@ -372,7 +374,7 @@ void test_05_bucket_batch_migration() {
     for (uint8_t i = 0; i < 3; i++) g_route_primary[buckets[i]] = 0;
 }
 
-// 6. Route-lock returns STATUS_RETRY from the master-level insert.
+// g. Route-lock returns STATUS_RETRY from the master-level insert.
 void test_06_locked_bucket_returns_retry() {
     uint32_t k = 0xBEEFCAFEu;
     uint32_t h  = murmur((const uint8_t*)&k, 4);
@@ -389,7 +391,7 @@ void test_06_locked_bucket_returns_retry() {
     TEST_ASSERT_EQUAL(STATUS_RETRY, st);
 }
 
-// 7. Hard reset wipes a slave completely.
+// h. Hard reset wipes a slave completely.
 void test_07_hard_reset_wipes_slave() {
     const uint16_t b = 5;
     const uint8_t owner = g_route_primary[b];
@@ -416,7 +418,7 @@ void test_07_hard_reset_wipes_slave() {
     TEST_ASSERT_EQUAL(STATUS_NOT_FOUND, lst);
 }
 
-// 8. Heavy load — measure FPR end-to-end.
+// i. Heavy load — measure FPR end-to-end.
 void test_08_load_and_fpr() {
     for (uint8_t i = 0; i < NUM_SLAVES; i++) g_storage[i].init();
     for (uint8_t i = 0; i < NUM_SLAVES; i++) g_disp[i]->clearDedup();
@@ -448,7 +450,7 @@ void test_08_load_and_fpr() {
     TEST_ASSERT_LESS_THAN(8.0, fpr);
 }
 
-// 9. UNAVAILABLE propagation: kill both owners → lookup says UNAVAILABLE.
+// j. UNAVAILABLE propagation: kill both owners → lookup says UNAVAILABLE.
 void test_09_unavailable_propagates() {
     for (uint8_t i = 0; i < NUM_SLAVES; i++) g_storage[i].init();
     for (uint8_t i = 0; i < NUM_SLAVES; i++) g_disp[i]->clearDedup();
@@ -476,7 +478,6 @@ void test_09_unavailable_propagates() {
     TEST_ASSERT_EQUAL(STATUS_OK, lookup_key((const uint8_t*)k, 5));
 }
 
-// ─── Runner ────────────────────────────────────────────────────────────────
 
 int main(int, char**) {
     srand(0xC0FFEE);
@@ -485,7 +486,7 @@ int main(int, char**) {
     RUN_TEST(test_01_insert_lookup_delete);
     RUN_TEST(test_02_many_inserts_and_lookups);
     RUN_TEST(test_03_try_only_does_not_evict);
-    RUN_TEST(test_04_dedup_replays_cached_result);
+    RUN_TEST(test_04_dedup_replays_cached_result); //
     RUN_TEST(test_05_bucket_batch_migration);
     RUN_TEST(test_06_locked_bucket_returns_retry);
     RUN_TEST(test_07_hard_reset_wipes_slave);
