@@ -8,8 +8,6 @@ static CuckooFilter cf;
 void setUp() { cf.clear(); }
 void tearDown() {}
 
-// ── Basic operations ────────────────────────────────────────────────────────
-
 void test_empty_filter() {
     TEST_ASSERT_EQUAL(0, cf.size());
     TEST_ASSERT_EQUAL(CF_NUM_BUCKETS * CF_BUCKET_SIZE, cf.capacity());
@@ -41,7 +39,7 @@ void test_delete_missing() {
     TEST_ASSERT_EQUAL(CF_NotFound, cf.remove(key, 5));
 }
 
-// ── Multiple items ──────────────────────────────────────────────────────────
+// multiple items
 
 void test_insert_many() {
     const size_t N = 100;
@@ -61,8 +59,6 @@ void test_insert_many() {
     }
 }
 
-// ── Clear ───────────────────────────────────────────────────────────────────
-
 void test_clear() {
     const uint8_t key[] = "abc";
     cf.add(key, 3);
@@ -71,7 +67,7 @@ void test_clear() {
     TEST_ASSERT_EQUAL(CF_NotFound, cf.contain(key, 3));
 }
 
-// ── Capacity limit ──────────────────────────────────────────────────────────
+// capacity limit 
 
 void test_fill_to_capacity() {
     srand(12345);
@@ -85,11 +81,11 @@ void test_fill_to_capacity() {
         if (s == CF_Ok) inserted++;
         else break;
     }
-    // Cuckoo filters typically achieve >90% occupancy
+    // typically achieve >90% occupancy
     TEST_ASSERT_GREATER_THAN(cf.capacity() * 80 / 100, inserted);
 }
 
-// ── Load percent ────────────────────────────────────────────────────────────
+// load %
 
 void test_load_percent() {
     srand(99);
@@ -104,6 +100,7 @@ void test_load_percent() {
 }
 
 int main(int argc, char** argv) {
+    //
     srand(42);
     UNITY_BEGIN();
     RUN_TEST(test_empty_filter);
