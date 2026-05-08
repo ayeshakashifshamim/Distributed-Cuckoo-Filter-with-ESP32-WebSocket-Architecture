@@ -234,13 +234,13 @@ The master will automatically begin routing to all registered slaves and will tr
 
 ## Milestones
 
-### Milestone 1 — Single-Node Filter + Communication ✅
+### Milestone 1 — Single-Node Filter + Communication 
 Single-node Cuckoo Filter with MurmurHash2, kickout loop, and victim cache. WebSocket transport (later replaced). Master/slave coordination with INSERT / DELETE / LOOKUP / SYNC / ACK / PING / HEARTBEAT. Native test harness with FPR measurement.
 
-### Milestone 2 — Distributed Operations ✅
+### Milestone 2 — Distributed Operations 
 Hash-based bucket partitioning across slaves. Distributed INSERT with kickout chains. Cooperative DELETE. Three-tier LOOKUP (primary → broadcast → local). Bucket migration via batched READ → WRITE → CLEAR protocol. Auto-rebalance on overload and slave join. Hard-reset on slave reconnect.
 
-### Milestone 3 — ESP-NOW Migration + Hardware Testing ✅
+### Milestone 3 — ESP-NOW Migration + Hardware Testing 
 Full rewrite of the transport layer from WebSocket to ESP-NOW. Packed binary protocol replacing JSON. Hardware tested with 1 master + 1 slave on physical ESP32 boards. Multi-slave behaviour verified in Wokwi simulation (laptop limited to 2 USB ports).
 
 ---
