@@ -1,0 +1,119 @@
+Collected 4 tests (test_benchmark, test_cuckoo_filter, test_e2e, test_protocol)
+
+Processing test_benchmark in native environment
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Building...
+
+
+Testing...
+
+=== FPR Benchmark ===
+  Inserted:         500
+  Non-member queries: 10000
+  False positives:  161
+  FPR:              1.61%
+  Expected (8-bit): ~3%
+=====================
+test\test_benchmark\test_benchmark.cpp:85:test_false_positive_rate:PASS
+
+=== Occupancy Benchmark ===
+  Capacity:  1024
+  Inserted:  1000
+  Occupancy: 97.7%
+===========================
+test\test_benchmark\test_benchmark.cpp:86:test_max_occupancy:PASS
+
+-----------------------
+2 Tests 0 Failures 0 Ignored
+OK
+
+------------------------------------------------------------------------------- native:test_benchmark [PASSED] Took 1.04 seconds -------------------------------------------------------------------------------
+
+Processing test_cuckoo_filter in native environment
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Building...
+
+
+Testing...
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:109:test_empty_filter:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:110:test_insert_and_lookup:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:111:test_lookup_missing:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:112:test_delete:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:113:test_delete_missing:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:114:test_insert_many:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:115:test_clear:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:116:test_fill_to_capacity:PASS
+test\test_cuckoo_filter\test_cuckoo_filter.cpp:117:test_load_percent:PASS
+
+-----------------------
+9 Tests 0 Failures 0 Ignored
+OK
+
+----------------------------------------------------------------------------- native:test_cuckoo_filter [PASSED] Took 1.06 seconds -----------------------------------------------------------------------------
+
+Processing test_e2e in native environment
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Building...
+
+
+Testing...
+test\test_e2e\test_e2e.cpp:484:test_00_routing_and_storage_init:PASS
+test\test_e2e\test_e2e.cpp:485:test_01_insert_lookup_delete:PASS
+test\test_e2e\test_e2e.cpp:486:test_02_many_inserts_and_lookups:PASS
+test\test_e2e\test_e2e.cpp:487:test_03_try_only_does_not_evict:PASS
+test\test_e2e\test_e2e.cpp:488:test_04_dedup_replays_cached_result:PASS
+Program errored with 3221225477 code
+--------------------------------------------------------------------------------- native:test_e2e [ERRORED] Took 12.06 seconds ---------------------------------------------------------------------------------
+
+Processing test_protocol in native environment
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+Building...
+
+
+Testing...
+test\test_protocol\test_protocol.cpp:91:test_header_size:PASS
+test\test_protocol\test_protocol.cpp:92:test_insert_size:PASS
+test\test_protocol\test_protocol.cpp:93:test_ack_size:PASS
+test\test_protocol\test_protocol.cpp:94:test_chain_insert_size:PASS
+test\test_protocol\test_protocol.cpp:95:test_chain_result_size:PASS
+test\test_protocol\test_protocol.cpp:96:test_tag_query_size:PASS
+test\test_protocol\test_protocol.cpp:97:test_hard_reset_size:PASS
+test\test_protocol\test_protocol.cpp:98:test_bucket_entry_size:PASS
+test\test_protocol\test_protocol.cpp:99:test_bucket_read_size:PASS
+test\test_protocol\test_protocol.cpp:100:test_bucket_data_size:PASS
+test\test_protocol\test_protocol.cpp:101:test_batch_under_espnow_limit:PASS
+test\test_protocol\test_protocol.cpp:102:test_header_offsets:PASS
+test\test_protocol\test_protocol.cpp:103:test_chain_insert_offsets:PASS
+test\test_protocol\test_protocol.cpp:104:test_chain_result_offsets:PASS
+test\test_protocol\test_protocol.cpp:105:test_insert_round_trip:PASS
+
+-----------------------
+15 Tests 0 Failures 0 Ignored
+OK
+
+-------------------------------------------------------------------------------- native:test_protocol [PASSED] Took 1.02 seconds --------------------------------------------------------------------------------
+
+==================================================================================================== SUMMARY ====================================================================================================
+Environment    Test                Status    Duration
+-------------  ------------------  --------  ------------
+master         test_benchmark      SKIPPED
+master         test_cuckoo_filter  SKIPPED
+master         test_e2e            SKIPPED
+master         test_protocol       SKIPPED
+slave          test_benchmark      SKIPPED
+slave          test_cuckoo_filter  SKIPPED
+slave          test_e2e            SKIPPED
+slave          test_protocol       SKIPPED
+slave2         test_benchmark      SKIPPED
+slave2         test_cuckoo_filter  SKIPPED
+slave2         test_e2e            SKIPPED
+slave2         test_protocol       SKIPPED
+native         test_benchmark      PASSED    00:00:01.038
+native         test_cuckoo_filter  PASSED    00:00:01.063
+native         test_e2e            ERRORED   00:00:12.060
+native         test_protocol       PASSED    00:00:01.018
+================================================================================== 32 test cases: 31 succeeded in 00:00:15.179 ==================================================================================
+
+
+
+

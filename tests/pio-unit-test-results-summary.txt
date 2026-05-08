@@ -1,0 +1,27 @@
+test_benchmark
+    test_false_positive_rate  PASS  — FPR 1.61% (expected ~3%)
+    test_max_occupancy       PASS  — 97.7% occupancy at 1000 inserts
+
+  test_cuckoo_filter (9 tests)
+    test_empty_filter         PASS
+    test_insert_and_lookup   PASS
+    test_lookup_missing      PASS
+    test_delete              PASS
+    test_delete_missing      PASS
+    test_insert_many         PASS
+    test_clear               PASS
+    test_fill_to_capacity    PASS
+    test_load_percent        PASS
+
+  test_e2e (5 tests — master+slave simulation)
+    test_00_routing_and_storage_init   PASS
+    test_01_insert_lookup_delete      PASS
+    test_02_many_inserts_and_lookups PASS
+    test_03_try_only_does_not_evict   PASS
+    test_04_dedup_replays_cached_result PASS
+    [crash on exit — pre-existing Windows issue]
+
+  test_protocol (15 tests)
+    All struct size and offset checks PASS
+
+  TOTAL: 31/32 PASS
