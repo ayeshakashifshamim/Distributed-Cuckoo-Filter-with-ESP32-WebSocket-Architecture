@@ -1,23 +1,25 @@
 #pragma once
-// slave_storage.h — Distributed cuckoo filter storage for one slave node.
+// slave_storage.h — Per-slave bucket backing store.
 //
-// A slave hosts an arbitrary, time-varying subset of GLOBAL_BUCKET_COUNT
-// logical buckets. To keep RAM bounded and allocation-free after boot:
-//   local_index[global_bucket] → physical slot index in bucket_pool, or -1
-//   bucket_pool[slot].tags[4]  → the CF_BUCKET_SIZE fingerprints for the bucket
-//   free_stack                 → physical slots currently available
+// Each slave holds a dynamic, time-varying subset of the GLOBAL_BUCKET_COUNT
+// logical bucket namespace. RAM is kept bounded via indirection:
 //
-// The single heap allocation happens once in init().
+//   bucket_to_slot[global_bucket] → physical slot index in bucket_pool, or -1
+//   bucket_pool[slot].tags[4]     → the 4 fingerprints for the bucket
+//   free_stack                    → LIFO stack of currently unused physical slots
+//
+// init() performs the single heap allocation; after that the structure is
+// allocation-free.
 #include <stdint.h>
 #include <vector>
 
 struct BucketData {
-    uint8_t tags[4];   // CF_BUCKET_SIZE fingerprints
+    uint8_t tags[4];
 };
 
 class SlaveStorage {
 public:
-    void init();                                    // (re)initialise to empty
+    void init();
 
     int16_t     index_of(uint16_t global_bucket) const;
     BucketData& bucket_at(int16_t slot)          { return _pool[(size_t)slot]; }
@@ -26,15 +28,15 @@ public:
     bool        release_if_empty(uint16_t global_bucket);
     void        force_clear(uint16_t global_bucket);
 
-    uint16_t    free_slots()  const { return (uint16_t)_free.size(); }
+    uint16_t    free_slots()  const { return (uint16_t)_free_stack.size(); }
     uint32_t    item_count()  const { return _items; }
 
     void        on_tag_added()   { _items++; }
     void        on_tag_removed() { if (_items) _items--; }
 
 private:
-    std::vector<int16_t>    _index;   // size = GLOBAL_BUCKET_COUNT
-    std::vector<BucketData> _pool;    // size = LOCAL_CAPACITY
-    std::vector<uint16_t>   _free;    // LIFO stack of free slots
+    std::vector<int16_t>    _bucket_to_slot;
+    std::vector<BucketData> _pool;
+    std::vector<uint16_t>   _free_stack;
     uint32_t                _items = 0;
 };

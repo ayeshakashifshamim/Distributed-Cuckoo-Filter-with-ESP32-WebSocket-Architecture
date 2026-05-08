@@ -1,11 +1,10 @@
 #pragma once
 // ─────────────────────────────────────────────────────────────────────────────
-// CuckooFilter — ESP32 adaptation of the reference implementation
+// CuckooFilter — embedded adaptation
 //   - No dynamic allocation  (static arrays, fixed at compile time)
 //   - No std::string / std::random_device / openssl / __int128
-//   - Uses MurmurHash2 (inline) + alt-index formula from the reference
-//   - Victim cache preserved exactly as in the reference (handles edge case
-//     where the last insertion cannot find a free slot after kMaxCuckooCount)
+//   - MurmurHash2 inline + XOR-based alternate-bucket formula
+//   - Victim cache handles the edge case where displacement is exhausted
 // ─────────────────────────────────────────────────────────────────────────────
 #include <stdint.h>
 #include <stddef.h>
@@ -30,16 +29,9 @@ class CuckooFilter {
 public:
     CuckooFilter();
 
-    /** Insert item bytes. Returns CF_Ok or CF_NotEnoughSpace. */
     CF_Status add(const uint8_t* data, size_t len);
-
-    /** Lookup item bytes. Returns CF_Ok (probably present) or CF_NotFound. */
     CF_Status contain(const uint8_t* data, size_t len) const;
-
-    /** Delete item bytes. Returns CF_Ok or CF_NotFound. */
     CF_Status remove(const uint8_t* data, size_t len);
-
-    /** Remove all entries. */
     void clear();
 
     size_t   size()        const { return _num_items; }
@@ -47,24 +39,22 @@ public:
     uint8_t  loadPercent() const;
 
 private:
-    // Table: [bucket][slot] each slot holds one tag (1 byte for 8-bit tags)
     uint8_t  _table[CF_NUM_BUCKETS][CF_BUCKET_SIZE];
     size_t   _num_items;
 
-    // Victim cache — exactly as in the reference
     struct { size_t index; uint32_t tag; bool used; } _victim;
 
     // ── Internal helpers ─────────────────────────────────────────────────────
-    static uint32_t _murmur(const uint8_t* data, size_t len);
-    static uint32_t _indexHash(uint32_t hv);
-    static uint32_t _tagHash(uint32_t hv);
-    static size_t   _altIndex(size_t index, uint32_t tag);
+    static uint32_t hash_bytes(const uint8_t* data, size_t len);
+    static uint32_t mask_bucket_idx(uint32_t hv);
+    static uint32_t derive_fingerprint(uint32_t hv);
+    static size_t   alt_index(size_t index, uint32_t tag);
 
-    void     _genIndexTag(const uint8_t* data, size_t len,
-                          size_t* index, uint32_t* tag) const;
-    bool     _insertTagToBucket(size_t i, uint32_t tag,
-                                bool kickout, uint32_t& oldtag);
-    bool     _findTagInBuckets(size_t i1, size_t i2, uint32_t tag) const;
-    bool     _deleteTagFromBucket(size_t i, uint32_t tag);
-    CF_Status _addImpl(size_t i, uint32_t tag);
+    void     _split_hash(const uint8_t* data, size_t len,
+                         size_t* index, uint32_t* tag) const;
+    bool     _slot_insert(size_t i, uint32_t tag,
+                           bool kickout, uint32_t& oldtag);
+    bool     _find_fingerprint(size_t i1, size_t i2, uint32_t tag) const;
+    bool     _erase_fingerprint(size_t i, uint32_t tag);
+    CF_Status _try_insert(size_t i, uint32_t tag);
 };

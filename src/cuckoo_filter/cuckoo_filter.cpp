@@ -1,20 +1,32 @@
-// cuckoo_filter.cpp — CuckooFilter implementation: MurmurHash2, bucket ops, kick-out insertion
+// cuckoo_filter.cpp — CuckooFilter implementation.
+//
+// Probabilistic set membership structure.  Each slot stores an 8-bit fingerprint
+// derived from the item's MurmurHash.  Buckets are 4 slots wide.  Insertion uses
+// cuckoo displacement (kickout chain) to handle collisions; a victim cache holds
+// one overflow item when the chain is exhausted.
+//
+// Properties:
+//   - False-positive rate: ~3% (8-bit fingerprints)
+//   - No external dependencies — runs on ESP32 with minimal RAM.
+//   - Single-byte fingerprints, victim cache, and up to 500 displacement attempts
+//     per insert.
+
 #include "cuckoo_filter.h"
 #include <string.h>   // memset
-#include <stdlib.h>   // rand() — seeded with esp_random() in main.cpp
+#include <stdlib.h>   // rand()
 
-// ─────────────────────────────────────────────────────────────────────────────
-// MurmurHash2 (32-bit) — same algorithm family used in the reference repo.
-// Works on byte arrays, no OS dependencies, runs fine on ESP32.
-// ─────────────────────────────────────────────────────────────────────────────
-uint32_t CuckooFilter::_murmur(const uint8_t* data, size_t len) {
+// ════════════════════════════════════════════════════════════════════════════
+// MurmurHash2 (32-bit) — deterministic, portable, no OS calls
+// ════════════════════════════════════════════════════════════════════════════
+
+uint32_t CuckooFilter::hash_bytes(const uint8_t* data, size_t len) {
     const uint32_t seed = 0xbc9f1d34;
     const uint32_t m    = 0x5bd1e995;
     uint32_t h = seed ^ (uint32_t)len;
 
     while (len >= 4) {
         uint32_t k;
-        memcpy(&k, data, 4);   // safe unaligned read
+        memcpy(&k, data, 4);
         k *= m;
         k ^= k >> 24;
         k *= m;
@@ -35,34 +47,45 @@ uint32_t CuckooFilter::_murmur(const uint8_t* data, size_t len) {
     return h;
 }
 
-// ─── Index / tag helpers (mirrored from the reference) ───────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Index and fingerprint derivation
+// ════════════════════════════════════════════════════════════════════════════
 
-uint32_t CuckooFilter::_indexHash(uint32_t hv) {
-    return hv & (CF_NUM_BUCKETS - 1);   // fast modulo for power-of-2
+// Fast modulo: GLOBAL_BUCKET_COUNT is a power of 2.
+uint32_t CuckooFilter::mask_bucket_idx(uint32_t hv) {
+    return hv & (CF_NUM_BUCKETS - 1);
 }
 
-uint32_t CuckooFilter::_tagHash(uint32_t hv) {
+// Low 8 bits of the hash, remapped so that 0 → 1.  Slot 0 in each bucket is
+// the "empty" sentinel, so fingerprint 0 is illegal.
+uint32_t CuckooFilter::derive_fingerprint(uint32_t hv) {
     uint32_t tag = hv & ((1u << CF_BITS_PER_TAG) - 1);
-    tag += (tag == 0);   // tag must never be 0 (0 means empty slot)
+    tag += (tag == 0);
     return tag;
 }
 
-// Alt-index formula straight from the reference (0x5bd1e995 = MurmurHash2 constant)
-size_t CuckooFilter::_altIndex(size_t index, uint32_t tag) {
-    return _indexHash((uint32_t)(index ^ (tag * 0x5bd1e995)));
+// Standard cuckoo alternate-bucket formula (XOR with tag-dependent value).
+size_t CuckooFilter::alt_index(size_t index, uint32_t tag) {
+    return mask_bucket_idx((uint32_t)(index ^ (tag * 0x5bd1e995)));
 }
 
-void CuckooFilter::_genIndexTag(const uint8_t* data, size_t len,
+// Parse an item into its primary bucket index and fingerprint.
+void CuckooFilter::_split_hash(const uint8_t* data, size_t len,
                                 size_t* index, uint32_t* tag) const {
-    uint32_t h = _murmur(data, len);
-    *index = _indexHash(h >> 8);   // use upper bits for index
-    *tag   = _tagHash(h);          // use lower bits for tag
+    uint32_t h = hash_bytes(data, len);
+    *index = mask_bucket_idx(h >> 8);
+    *tag   = derive_fingerprint(h);
 }
 
-// ─── Bucket operations ────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Bucket primitives
+// ════════════════════════════════════════════════════════════════════════════
 
-bool CuckooFilter::_insertTagToBucket(size_t i, uint32_t tag,
-                                      bool kickout, uint32_t& oldtag) {
+// Try to place `tag` in bucket `i`.  Returns true on success.  If the bucket
+// is full and kickout=true, a random slot is displaced and its old value is
+// written to `oldtag`.
+bool CuckooFilter::_slot_insert(size_t i, uint32_t tag,
+                                 bool kickout, uint32_t& oldtag) {
     for (size_t j = 0; j < CF_BUCKET_SIZE; j++) {
         if (_table[i][j] == 0) {
             _table[i][j] = (uint8_t)tag;
@@ -77,7 +100,8 @@ bool CuckooFilter::_insertTagToBucket(size_t i, uint32_t tag,
     return false;
 }
 
-bool CuckooFilter::_findTagInBuckets(size_t i1, size_t i2, uint32_t tag) const {
+// Scan both primary and alternate buckets for a matching fingerprint.
+bool CuckooFilter::_find_fingerprint(size_t i1, size_t i2, uint32_t tag) const {
     uint8_t t = (uint8_t)tag;
     for (size_t j = 0; j < CF_BUCKET_SIZE; j++) {
         if (_table[i1][j] == t || _table[i2][j] == t)
@@ -86,7 +110,8 @@ bool CuckooFilter::_findTagInBuckets(size_t i1, size_t i2, uint32_t tag) const {
     return false;
 }
 
-bool CuckooFilter::_deleteTagFromBucket(size_t i, uint32_t tag) {
+// Remove the first matching fingerprint from a bucket.  Returns true on success.
+bool CuckooFilter::_erase_fingerprint(size_t i, uint32_t tag) {
     uint8_t t = (uint8_t)tag;
     for (size_t j = 0; j < CF_BUCKET_SIZE; j++) {
         if (_table[i][j] == t) {
@@ -97,31 +122,35 @@ bool CuckooFilter::_deleteTagFromBucket(size_t i, uint32_t tag) {
     return false;
 }
 
-// ─── Core add logic (mirrored from reference AddImpl) ────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Core insert with displacement
+// ════════════════════════════════════════════════════════════════════════════
 
-CF_Status CuckooFilter::_addImpl(size_t i, uint32_t tag) {
+CF_Status CuckooFilter::_try_insert(size_t i, uint32_t tag) {
     size_t   curindex = i;
     uint32_t curtag   = tag;
     uint32_t oldtag   = 0;
 
-    for (uint32_t count = 0; count < CF_MAX_KICKS; count++) {
-        bool kickout = (count > 0);
+    for (uint32_t attempt = 0; attempt < CF_MAX_KICKS; attempt++) {
+        bool kicked = (attempt > 0);
         oldtag = 0;
-        if (_insertTagToBucket(curindex, curtag, kickout, oldtag)) {
+        if (_slot_insert(curindex, curtag, kicked, oldtag)) {
             _num_items++;
             return CF_Ok;
         }
-        if (kickout) curtag = oldtag;
-        curindex = _altIndex(curindex, curtag);
+        if (kicked) curtag = oldtag;
+        curindex = alt_index(curindex, curtag);
     }
-    // Store the displaced tag in victim cache (reference behaviour)
+    // Exhausted displacement budget — store displaced item in victim cache.
     _victim.index = curindex;
     _victim.tag   = curtag;
     _victim.used  = true;
-    return CF_Ok;   // reference returns Ok here (victim holds the item)
+    return CF_Ok;
 }
 
-// ─── Public API ──────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Public API
+// ════════════════════════════════════════════════════════════════════════════
 
 CuckooFilter::CuckooFilter() : _num_items(0) {
     memset(_table, 0, sizeof(_table));
@@ -132,21 +161,21 @@ CF_Status CuckooFilter::add(const uint8_t* data, size_t len) {
     if (_victim.used) return CF_NotEnoughSpace;
     size_t   i;
     uint32_t tag;
-    _genIndexTag(data, len, &i, &tag);
-    return _addImpl(i, tag);
+    _split_hash(data, len, &i, &tag);
+    return _try_insert(i, tag);
 }
 
 CF_Status CuckooFilter::contain(const uint8_t* data, size_t len) const {
     size_t   i1, i2;
     uint32_t tag;
-    _genIndexTag(data, len, &i1, &tag);
-    i2 = _altIndex(i1, tag);
+    _split_hash(data, len, &i1, &tag);
+    i2 = alt_index(i1, tag);
 
     bool found = (_victim.used &&
                   tag == _victim.tag &&
                   (i1 == _victim.index || i2 == _victim.index));
 
-    if (found || _findTagInBuckets(i1, i2, tag))
+    if (found || _find_fingerprint(i1, i2, tag))
         return CF_Ok;
     return CF_NotFound;
 }
@@ -154,19 +183,17 @@ CF_Status CuckooFilter::contain(const uint8_t* data, size_t len) const {
 CF_Status CuckooFilter::remove(const uint8_t* data, size_t len) {
     size_t   i1, i2;
     uint32_t tag;
-    _genIndexTag(data, len, &i1, &tag);
-    i2 = _altIndex(i1, tag);
+    _split_hash(data, len, &i1, &tag);
+    i2 = alt_index(i1, tag);
 
-    if (_deleteTagFromBucket(i1, tag) || _deleteTagFromBucket(i2, tag)) {
+    if (_erase_fingerprint(i1, tag) || _erase_fingerprint(i2, tag)) {
         _num_items--;
-        // Re-insert victim if one exists (reference behaviour)
         if (_victim.used) {
             _victim.used = false;
-            _addImpl(_victim.index, _victim.tag);
+            _try_insert(_victim.index, _victim.tag);
         }
         return CF_Ok;
     }
-    // Check victim cache
     if (_victim.used && tag == _victim.tag &&
         (i1 == _victim.index || i2 == _victim.index)) {
         _victim.used = false;

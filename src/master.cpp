@@ -1,10 +1,13 @@
-// master.cpp — Distributed cuckoo filter coordinator (Milestone 2).
+// master.cpp — Distributed cuckoo filter coordinator.
 //
-// Owns the global routing table g_route_primary[b] → slave_index, issues
-// chain-insert / tag-lookup / tag-delete operations to the owning slave, and
-// runs a bucket-level rebalancer driven by heartbeat load reports.
+// Responsibilities:
+//   - Maintains bucket→node ownership mapping (bucket_owner[])
+//   - Drives distributed insert (kickout chain) / lookup / delete by forwarding
+//     to the relevant slave via ESP-NOW and waiting for a synchronous reply.
+//   - Monitors slave liveness via heartbeats and triggers reactive bucket
+//     rebalancing when load imbalance or overload is detected.
 //
-// This file compiles only for the master firmware build.
+// Firmware build: master only (SLAVE_BUILD must not be defined).
 
 #if !defined(NATIVE_BUILD) && defined(MASTER_BUILD)
 
@@ -16,27 +19,30 @@
 #include "protocol/messages.h"
 #include "transport/transport.h"
 
-// ── Master-local state ──────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Node registry
+// ════════════════════════════════════════════════════════════════════════════
 
-struct SlaveInfo {
+struct NodeRecord {
     uint8_t        id;
     const uint8_t* mac;
     bool           alive;
-    uint32_t       last_hb_ms;
+    uint32_t       last_heartbeat_ms;
     uint32_t       item_count;
     uint16_t       capacity;
     uint8_t        load_pct;
 };
 
-static SlaveInfo g_slaves[NUM_SLAVES];
+static NodeRecord node_registry[NUM_SLAVES];
 
-// Flat routing table: global bucket → slave index. `locked` flag is set during
-// rebalancing so lookups/inserts/deletes return STATUS_RETRY for buckets in
-// flight.
-static uint8_t g_route_primary[GLOBAL_BUCKET_COUNT];
-static bool    g_route_locked [GLOBAL_BUCKET_COUNT];
+// bucket_owner[b] → owning slave index (0-based).  bucket_busy[b] is set
+// while a bucket is mid-migration so that concurrent ops return STATUS_RETRY.
+static uint8_t bucket_owner[GLOBAL_BUCKET_COUNT];
+static bool    bucket_busy [GLOBAL_BUCKET_COUNT];
 
-// ── Reply synchronisation (single outstanding request at a time) ────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Sequence-numbered reply synchronisation
+// ════════════════════════════════════════════════════════════════════════════
 
 static uint8_t           g_seq = 0;
 static volatile bool     g_reply_ready = false;
@@ -44,16 +50,19 @@ static volatile uint8_t  g_reply_status = STATUS_ERROR;
 static volatile uint8_t  g_reply_seq    = 0;
 static volatile uint8_t  g_reply_evicted_tag = 0;
 
-static volatile bool            g_batch_data_ready = false;
-static MsgBucketBatchData       g_batch_data_buf;
+static volatile bool          g_batch_data_ready = false;
+static MsgBucketBatchData     g_batch_data_buf;
 
-static uint32_t g_chain_op_id = 1;
+static uint32_t g_operation_id = 1;
 
-// Auto-rebalance scheduling — heartbeat flags work, loop() runs the migration.
+// Auto-rebalance: heartbeat handlers set a flag; loop() processes it on a
+// cooldown timer so that migration storms are avoided.
 static volatile bool g_rebalance_pending = false;
 static uint32_t      g_last_rebalance_ms = 0;
 
-// ── Hashing (master only — slaves receive explicit bucket + tag) ────────────
+// ════════════════════════════════════════════════════════════════════════════
+// MurmurHash2 (32-bit) — deterministic, no OS dependencies, ESP32-safe
+// ════════════════════════════════════════════════════════════════════════════
 
 static uint32_t murmur_hash(const uint8_t* data, size_t len) {
     const uint32_t seed = 0xbc9f1d34, m = 0x5bd1e995;
@@ -66,37 +75,59 @@ static uint32_t murmur_hash(const uint8_t* data, size_t len) {
     }
     switch (len) {
         case 3: h ^= (uint32_t)data[2] << 16; /* fallthrough */
-        case 2: h ^= (uint32_t)data[1] << 8;  /* fallthrough */
+        case 2: h ^= (uint32_t)data[1] <<  8; /* fallthrough */
         case 1: h ^= (uint32_t)data[0]; h *= m;
     }
     h ^= h >> 13; h *= m; h ^= h >> 15;
     return h;
 }
 
-static uint8_t  tag_of(uint32_t h)  { uint8_t t = (uint8_t)(h & 0xFF); return t ? t : 1; }
-static uint16_t bucket1_of(uint32_t h) { return (uint16_t)((h >> 8) & (GLOBAL_BUCKET_COUNT - 1)); }
-static uint16_t alt_bucket(uint16_t b, uint8_t tag) {
+// Fingerprint extracted from the hash's low byte.  Zero is remapped to 1 so
+// that slot 0 in each bucket remains the "empty" sentinel.
+static uint8_t  fingerprint_of(uint32_t h)  { uint8_t t = (uint8_t)(h & 0xFF); return t ? t : 1; }
+
+// Primary bucket index: upper 24 bits of the hash, masked to GLOBAL_BUCKET_COUNT.
+static uint16_t primary_bucket_of(uint32_t h) { return (uint16_t)((h >> 8) & (GLOBAL_BUCKET_COUNT - 1)); }
+
+// Alternate bucket under the standard cuckoo XOR mixing formula.
+static uint16_t alternate_bucket(uint16_t b, uint8_t tag) {
     return (uint16_t)((b ^ (uint32_t)(tag * 0x5bd1e995u)) & (GLOBAL_BUCKET_COUNT - 1));
 }
 
-// ── Routing table helpers ───────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Bucket-to-node assignment
+//
+// PROBLEM: the old sequential modulo mapping
+//   bucket_owner[b] = b % NUM_SLAVES
+// produced contiguous ranges per slave.  Any non-uniformity in hash-driven
+// item distribution (or in the cuckoo kickout chain) therefore concentrated
+// load onto particular slaves.
+//
+// SOLUTION: hash-based scatter.
+//   bucket_owner[b] = murmur_hash(&b, sizeof(b)) % NUM_SLAVES
+// This distributes consecutive bucket indices across all slaves so that hash
+// skew is averaged out rather than being mapped onto a single slave's range.
+// ════════════════════════════════════════════════════════════════════════════
 
-static void routing_init() {
+static void assign_buckets_to_nodes() {
     for (uint16_t b = 0; b < GLOBAL_BUCKET_COUNT; b++) {
-        g_route_primary[b] = (uint8_t)(b % NUM_SLAVES);
-        g_route_locked[b]  = false;
+        uint32_t h = murmur_hash((const uint8_t*)&b, sizeof(b));
+        bucket_owner[b] = (uint8_t)(h % NUM_SLAVES);
+        bucket_busy[b]  = false;
     }
 }
 
-static SlaveInfo* slave_by_src(uint16_t src_id) {
+static NodeRecord* find_node_by_id(uint16_t src_id) {
     for (uint8_t i = 0; i < NUM_SLAVES; i++)
-        if (g_slaves[i].id == (uint8_t)src_id) return &g_slaves[i];
+        if (node_registry[i].id == (uint8_t)src_id) return &node_registry[i];
     return nullptr;
 }
 
-// ── Low-level send/wait ─────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Low-level send / await helpers
+// ════════════════════════════════════════════════════════════════════════════
 
-static bool wait_for_reply(uint8_t req_seq, uint32_t timeout_ms) {
+static bool await_ack(uint8_t req_seq, uint32_t timeout_ms) {
     uint32_t start = millis();
     while ((millis() - start) < timeout_ms) {
         if (g_reply_ready && g_reply_seq == req_seq) {
@@ -108,7 +139,7 @@ static bool wait_for_reply(uint8_t req_seq, uint32_t timeout_ms) {
     return false;
 }
 
-static bool wait_for_batch_data(uint32_t timeout_ms) {
+static bool await_batch_data(uint32_t timeout_ms) {
     uint32_t start = millis();
     while ((millis() - start) < timeout_ms) {
         if (g_batch_data_ready) { g_batch_data_ready = false; return true; }
@@ -117,10 +148,12 @@ static bool wait_for_batch_data(uint32_t timeout_ms) {
     return false;
 }
 
-static bool send_chain_insert(uint8_t slave_idx, uint16_t bucket, uint8_t tag,
-                              uint32_t op_id, uint8_t hop, bool try_only,
-                              uint8_t* out_status, uint8_t* out_evicted) {
-    SlaveInfo& s = g_slaves[slave_idx];
+// ── Outbound message builders ───────────────────────────────────────────────
+
+static bool propagate_cuckoo_insert(uint8_t slave_idx, uint16_t bucket, uint8_t tag,
+                                   uint32_t op_id, uint8_t hop, bool try_only,
+                                   uint8_t* out_status, uint8_t* out_evicted) {
+    NodeRecord& s = node_registry[slave_idx];
     if (!s.alive) { *out_status = STATUS_UNAVAILABLE; return false; }
 
     MsgChainInsert msg;
@@ -138,15 +171,15 @@ static bool send_chain_insert(uint8_t slave_idx, uint16_t bucket, uint8_t tag,
 
     g_reply_ready = false;
     transport_send(s.mac, (const uint8_t*)&msg, sizeof(msg));
-    if (!wait_for_reply(g_seq, 1000)) { *out_status = STATUS_UNAVAILABLE; return false; }
+    if (!await_ack(g_seq, 1000)) { *out_status = STATUS_UNAVAILABLE; return false; }
     *out_status  = g_reply_status;
     *out_evicted = g_reply_evicted_tag;
     return true;
 }
 
-static bool send_tag_query(uint8_t slave_idx, uint8_t cmd, uint16_t bucket, uint8_t tag,
-                           uint8_t* out_status) {
-    SlaveInfo& s = g_slaves[slave_idx];
+static bool query_bucket_tag(uint8_t slave_idx, uint8_t cmd, uint16_t bucket, uint8_t tag,
+                             uint8_t* out_status) {
+    NodeRecord& s = node_registry[slave_idx];
     if (!s.alive) { *out_status = STATUS_UNAVAILABLE; return false; }
 
     MsgTagQuery msg;
@@ -160,13 +193,13 @@ static bool send_tag_query(uint8_t slave_idx, uint8_t cmd, uint16_t bucket, uint
 
     g_reply_ready = false;
     transport_send(s.mac, (const uint8_t*)&msg, sizeof(msg));
-    if (!wait_for_reply(g_seq, 1000)) { *out_status = STATUS_UNAVAILABLE; return false; }
+    if (!await_ack(g_seq, 1000)) { *out_status = STATUS_UNAVAILABLE; return false; }
     *out_status = g_reply_status;
     return true;
 }
 
-static bool send_hard_reset(uint8_t slave_idx) {
-    SlaveInfo& s = g_slaves[slave_idx];
+static bool transmit_hard_reset(uint8_t slave_idx) {
+    NodeRecord& s = node_registry[slave_idx];
     MsgHardReset msg;
     memset(&msg, 0, sizeof(msg));
     msg.hdr.type   = MSG_HARD_RESET;
@@ -176,61 +209,76 @@ static bool send_hard_reset(uint8_t slave_idx) {
 
     g_reply_ready = false;
     transport_send(s.mac, (const uint8_t*)&msg, sizeof(msg));
-    return wait_for_reply(g_seq, 1500) && g_reply_status == STATUS_OK;
+    return await_ack(g_seq, 1500) && g_reply_status == STATUS_OK;
 }
 
-// ── Distributed operations ─────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Distributed operations
+// ════════════════════════════════════════════════════════════════════════════
 
-static uint8_t distributed_insert_key(const uint8_t* key, uint8_t key_len) {
-    if (key_len == 0) return STATUS_ERROR;
-    uint32_t h  = murmur_hash(key, key_len);
-    uint8_t  tg = tag_of(h);
-    uint16_t b1 = bucket1_of(h);
-    uint16_t b2 = alt_bucket(b1, tg);
-    uint32_t op = g_chain_op_id++;
-
-    // Phase 1 — soft try b1 then b2 (no kickout).
+// Phase 1 — attempt non-kickout insert into primary then alternate bucket.
+// Returns early on first STATUS_OK.
+static uint8_t try_soft_insert(uint32_t h, uint8_t tg, uint16_t b1, uint16_t b2, uint32_t op) {
     for (uint8_t i = 0; i < 2; i++) {
         uint16_t b = (i == 0) ? b1 : b2;
-        if (g_route_locked[b]) continue;
-        uint8_t owner = g_route_primary[b];
-        if (!g_slaves[owner].alive) continue;
+        if (bucket_busy[b]) continue;
+        uint8_t owner = bucket_owner[b];
+        if (!node_registry[owner].alive) continue;
         uint8_t st = STATUS_ERROR, ev = 0;
-        if (!send_chain_insert(owner, b, tg, op, 0, /*try_only=*/true, &st, &ev)) continue;
+        if (!propagate_cuckoo_insert(owner, b, tg, op, 0, /*try_only=*/true, &st, &ev)) continue;
         if (st == STATUS_OK) return STATUS_OK;
     }
+    return STATUS_FULL;
+}
 
-    // Phase 2 — force chain starting at a random candidate.
+// Phase 2 — hard insert with kickout chain.  A random candidate bucket is
+// selected; each STATUS_KICKED reply carries the evicted tag which is then
+// inserted into its alternate bucket.  Chain halts at MAX_CHAIN_HOPS.
+static uint8_t execute_kickout_chain(uint8_t tg, uint16_t b1, uint16_t b2, uint32_t op) {
     uint16_t cur = ((rand() & 1) ? b1 : b2);
     uint8_t  ctg = tg;
     for (uint8_t hop = 0; hop < MAX_CHAIN_HOPS; hop++) {
-        if (g_route_locked[cur]) return STATUS_RETRY;
-        uint8_t owner = g_route_primary[cur];
-        if (!g_slaves[owner].alive) return STATUS_UNAVAILABLE;
+        if (bucket_busy[cur]) return STATUS_RETRY;
+        uint8_t owner = bucket_owner[cur];
+        if (!node_registry[owner].alive) return STATUS_UNAVAILABLE;
         uint8_t st = STATUS_ERROR, ev = 0;
-        if (!send_chain_insert(owner, cur, ctg, op, hop, /*try_only=*/false, &st, &ev))
+        if (!propagate_cuckoo_insert(owner, cur, ctg, op, hop, /*try_only=*/false, &st, &ev))
             return STATUS_UNAVAILABLE;
         if (st == STATUS_OK)     return STATUS_OK;
         if (st != STATUS_KICKED) return st;
         ctg = ev;
-        cur = alt_bucket(cur, ctg);
+        cur = alternate_bucket(cur, ctg);
     }
     return STATUS_FULL;
+}
+
+// Returns STATUS_OK, STATUS_FULL, STATUS_RETRY, STATUS_UNAVAILABLE.
+static uint8_t distributed_insert_key(const uint8_t* key, uint8_t key_len) {
+    if (key_len == 0) return STATUS_ERROR;
+    uint32_t h  = murmur_hash(key, key_len);
+    uint8_t  tg = fingerprint_of(h);
+    uint16_t b1 = primary_bucket_of(h);
+    uint16_t b2 = alternate_bucket(b1, tg);
+    uint32_t op = g_operation_id++;
+
+    uint8_t st = try_soft_insert(h, tg, b1, b2, op);
+    if (st != STATUS_FULL) return st;
+    return execute_kickout_chain(tg, b1, b2, op);
 }
 
 static uint8_t distributed_lookup_key(const uint8_t* key, uint8_t key_len) {
     if (key_len == 0) return STATUS_ERROR;
     uint32_t h  = murmur_hash(key, key_len);
-    uint8_t  tg = tag_of(h);
-    uint16_t b1 = bucket1_of(h);
-    uint16_t b2 = alt_bucket(b1, tg);
+    uint8_t  tg = fingerprint_of(h);
+    uint16_t b1 = primary_bucket_of(h);
+    uint16_t b2 = alternate_bucket(b1, tg);
 
     bool any_unavailable = false;
     for (uint8_t i = 0; i < 2; i++) {
         uint16_t b = (i == 0) ? b1 : b2;
-        if (g_route_locked[b]) return STATUS_RETRY;
+        if (bucket_busy[b]) return STATUS_RETRY;
         uint8_t st = STATUS_ERROR;
-        if (!send_tag_query(g_route_primary[b], MSG_TAG_LOOKUP, b, tg, &st)) {
+        if (!query_bucket_tag(bucket_owner[b], MSG_TAG_LOOKUP, b, tg, &st)) {
             any_unavailable = true; continue;
         }
         if (st == STATUS_OK) return STATUS_OK;
@@ -241,16 +289,16 @@ static uint8_t distributed_lookup_key(const uint8_t* key, uint8_t key_len) {
 static uint8_t distributed_delete_key(const uint8_t* key, uint8_t key_len) {
     if (key_len == 0) return STATUS_ERROR;
     uint32_t h  = murmur_hash(key, key_len);
-    uint8_t  tg = tag_of(h);
-    uint16_t b1 = bucket1_of(h);
-    uint16_t b2 = alt_bucket(b1, tg);
+    uint8_t  tg = fingerprint_of(h);
+    uint16_t b1 = primary_bucket_of(h);
+    uint16_t b2 = alternate_bucket(b1, tg);
 
     bool any_unavailable = false;
     for (uint8_t i = 0; i < 2; i++) {
         uint16_t b = (i == 0) ? b1 : b2;
-        if (g_route_locked[b]) return STATUS_RETRY;
+        if (bucket_busy[b]) return STATUS_RETRY;
         uint8_t st = STATUS_ERROR;
-        if (!send_tag_query(g_route_primary[b], MSG_TAG_DELETE, b, tg, &st)) {
+        if (!query_bucket_tag(bucket_owner[b], MSG_TAG_DELETE, b, tg, &st)) {
             any_unavailable = true; continue;
         }
         if (st == STATUS_OK) return STATUS_OK;
@@ -258,10 +306,17 @@ static uint8_t distributed_delete_key(const uint8_t* key, uint8_t key_len) {
     return any_unavailable ? STATUS_UNAVAILABLE : STATUS_NOT_FOUND;
 }
 
-// ── Rebalancing (3 round-trip bucket migration) ────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Reactive bucket rebalancer
+//
+// Triggered when any slave exceeds REBALANCE_THRESHOLD load or when the
+// max-min load gap across live slaves exceeds IMBALANCE_THRESHOLD.  Runs
+// three ESP-NOW round-trips (read → write → clear) to migrate a batch of
+// buckets from the most-loaded to the least-loaded slave.
+// ════════════════════════════════════════════════════════════════════════════
 
-static void unlock_batch(const uint16_t* batch, uint8_t n) {
-    for (uint8_t i = 0; i < n; i++) g_route_locked[batch[i]] = false;
+static void unlock_buckets(const uint16_t* batch, uint8_t n) {
+    for (uint8_t i = 0; i < n; i++) bucket_busy[batch[i]] = false;
 }
 
 static void cmd_rebalance() {
@@ -271,9 +326,9 @@ static void cmd_rebalance() {
     int8_t  src = -1, dst = -1;
     uint8_t max_load = 0, min_load = 101;
     for (uint8_t i = 0; i < NUM_SLAVES; i++) {
-        if (!g_slaves[i].alive) continue;
-        if (g_slaves[i].load_pct > max_load) { max_load = g_slaves[i].load_pct; src = (int8_t)i; }
-        if (g_slaves[i].load_pct < min_load) { min_load = g_slaves[i].load_pct; dst = (int8_t)i; }
+        if (!node_registry[i].alive) continue;
+        if (node_registry[i].load_pct > max_load) { max_load = node_registry[i].load_pct; src = (int8_t)i; }
+        if (node_registry[i].load_pct < min_load) { min_load = node_registry[i].load_pct; dst = (int8_t)i; }
     }
     if (src < 0 || dst < 0 || src == dst) {
         Serial.println("[MASTER] REBALANCE: no candidates"); return;
@@ -284,91 +339,92 @@ static void cmd_rebalance() {
         Serial.println("[MASTER] REBALANCE: cluster balanced"); return;
     }
     Serial.printf("[MASTER] REBALANCE %s: src=0x%02X (%u%%) dst=0x%02X (%u%%)\n",
-                  overload ? "overload" : "imbalance",
-                  g_slaves[src].id, max_load, g_slaves[dst].id, min_load);
+                 overload ? "overload" : "imbalance",
+                 node_registry[src].id, max_load, node_registry[dst].id, min_load);
 
-    // Guard: dst must have free physical slots to receive buckets.
+    // Verify destination has at least one free physical slot.
     uint16_t dst_owned = 0;
     for (uint16_t b = 0; b < GLOBAL_BUCKET_COUNT; b++)
-        if (g_route_primary[b] == (uint8_t)dst) dst_owned++;
+        if (bucket_owner[b] == (uint8_t)dst) dst_owned++;
     if (dst_owned >= LOCAL_CAPACITY) {
         Serial.println("[MASTER] REBALANCE: dst has no free slots"); return;
     }
     uint8_t dst_free = (uint8_t)(LOCAL_CAPACITY - dst_owned);
 
-    // Pick up to MAX_BUCKET_BATCH (and no more than dst_free) buckets currently
-    // owned by src that aren't already locked by another in-flight operation.
+    // Collect up to dst_free non-locked buckets from the source.
     uint16_t batch[MAX_BUCKET_BATCH];
     uint8_t  n = 0;
     uint8_t  cap = (dst_free < MAX_BUCKET_BATCH) ? dst_free : MAX_BUCKET_BATCH;
     for (uint16_t b = 0; b < GLOBAL_BUCKET_COUNT && n < cap; b++) {
-        if (g_route_primary[b] == (uint8_t)src && !g_route_locked[b]) batch[n++] = b;
+        if (bucket_owner[b] == (uint8_t)src && !bucket_busy[b]) batch[n++] = b;
     }
     if (n == 0) { Serial.println("[MASTER] REBALANCE: no eligible buckets"); return; }
 
-    for (uint8_t i = 0; i < n; i++) g_route_locked[batch[i]] = true;
+    for (uint8_t i = 0; i < n; i++) bucket_busy[batch[i]] = true;
 
-    // Round 1 — read.
+    // Round 1 — read bucket contents from source.
     MsgBucketBatchRead rd;
     memset(&rd, 0, sizeof(rd));
     rd.hdr.type = MSG_BUCKET_BATCH_READ;
     rd.hdr.seq  = ++g_seq;
     rd.hdr.src_id = MASTER_ID;
-    rd.hdr.dst_id = g_slaves[src].id;
+    rd.hdr.dst_id = node_registry[src].id;
     rd.count = n;
     memcpy(rd.buckets, batch, n * sizeof(uint16_t));
 
     g_batch_data_ready = false;
-    transport_send(g_slaves[src].mac, (const uint8_t*)&rd, sizeof(rd));
-    if (!wait_for_batch_data(1500)) { unlock_batch(batch, n); Serial.println("[MASTER] REBALANCE: read timeout"); return; }
+    transport_send(node_registry[src].mac, (const uint8_t*)&rd, sizeof(rd));
+    if (!await_batch_data(1500)) { unlock_buckets(batch, n); Serial.println("[MASTER] REBALANCE: read timeout"); return; }
 
-    // Round 2 — write to dst.
+    // Round 2 — write contents into destination.
     MsgBucketBatchWrite wr;
     memset(&wr, 0, sizeof(wr));
     wr.hdr.type = MSG_BUCKET_BATCH_WRITE;
     wr.hdr.seq  = ++g_seq;
     wr.hdr.src_id = MASTER_ID;
-    wr.hdr.dst_id = g_slaves[dst].id;
+    wr.hdr.dst_id = node_registry[dst].id;
     wr.count = g_batch_data_buf.count;
     memcpy(wr.entries, g_batch_data_buf.entries, wr.count * sizeof(BucketEntry));
 
     g_reply_ready = false;
-    transport_send(g_slaves[dst].mac, (const uint8_t*)&wr, sizeof(wr));
-    if (!wait_for_reply(g_seq, 1500) || g_reply_status != STATUS_OK) {
-        unlock_batch(batch, n); Serial.println("[MASTER] REBALANCE: write failed"); return;
+    transport_send(node_registry[dst].mac, (const uint8_t*)&wr, sizeof(wr));
+    if (!await_ack(g_seq, 1500) || g_reply_status != STATUS_OK) {
+        unlock_buckets(batch, n); Serial.println("[MASTER] REBALANCE: write failed"); return;
     }
 
-    // Round 3 — clear on src.
+    // Round 3 — clear source.
     MsgBucketBatchClear cl;
     memset(&cl, 0, sizeof(cl));
     cl.hdr.type = MSG_BUCKET_BATCH_CLEAR;
     cl.hdr.seq  = ++g_seq;
     cl.hdr.src_id = MASTER_ID;
-    cl.hdr.dst_id = g_slaves[src].id;
+    cl.hdr.dst_id = node_registry[src].id;
     cl.count = n;
     memcpy(cl.buckets, batch, n * sizeof(uint16_t));
 
     g_reply_ready = false;
-    transport_send(g_slaves[src].mac, (const uint8_t*)&cl, sizeof(cl));
-    if (!wait_for_reply(g_seq, 1500) || g_reply_status != STATUS_OK) {
-        unlock_batch(batch, n); Serial.println("[MASTER] REBALANCE: clear failed"); return;
+    transport_send(node_registry[src].mac, (const uint8_t*)&cl, sizeof(cl));
+    if (!await_ack(g_seq, 1500) || g_reply_status != STATUS_OK) {
+        unlock_buckets(batch, n); Serial.println("[MASTER] REBALANCE: clear failed"); return;
     }
 
+    // Publish new ownership and unlock.
     for (uint8_t i = 0; i < n; i++) {
-        g_route_primary[batch[i]] = (uint8_t)dst;
-        g_route_locked [batch[i]] = false;
+        bucket_owner[batch[i]] = (uint8_t)dst;
+        bucket_busy[batch[i]]  = false;
     }
     Serial.printf("[MASTER] REBALANCE done: %u buckets 0x%02X -> 0x%02X\n",
-                  n, g_slaves[src].id, g_slaves[dst].id);
+                  n, node_registry[src].id, node_registry[dst].id);
 }
 
-// ── Serial command handlers ─────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Serial command handlers
+// ════════════════════════════════════════════════════════════════════════════
 
 static void cmd_insert(const uint8_t* key, uint8_t key_len) {
     if (key_len == 0) { Serial.println("[USAGE] i <key>"); return; }
     if (key_len > 8) key_len = 8;
-    
-    // Convert key to printable string safely
+
     char keyStr[9] = {0};
     memcpy(keyStr, key, key_len);
 
@@ -409,11 +465,11 @@ static void cmd_status() {
     Serial.println("NODE   STATUS   ITEMS / CAP   PING");
     uint32_t now = millis();
     for (uint8_t i = 0; i < NUM_SLAVES; i++) {
-        SlaveInfo& s = g_slaves[i];
-        uint32_t ping = s.alive ? (now - s.last_hb_ms) : 0;
+        NodeRecord& s = node_registry[i];
+        uint32_t ping = s.alive ? (now - s.last_heartbeat_ms) : 0;
         Serial.printf("0x%02X   %-6s   %lu / %-5u   %lums\n",
                       s.id, s.alive ? "UP" : "DOWN",
-                      (unsigned long)s.item_count, s.capacity, 
+                      (unsigned long)s.item_count, s.capacity,
                       (unsigned long)ping);
     }
     Serial.println();
@@ -480,7 +536,9 @@ static void handle_serial() {
     }
 }
 
-// ── Receive callback ───────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// ESP-NOW receive callback — WiFi task context, must not block.
+// ════════════════════════════════════════════════════════════════════════════
 
 void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
     (void)mac;
@@ -510,28 +568,26 @@ void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
     }
     if (type == MSG_HEARTBEAT && len >= (int)sizeof(MsgHeartbeat)) {
         const MsgHeartbeat* hb = (const MsgHeartbeat*)data;
-        SlaveInfo* sl = slave_by_src(hb->hdr.src_id);
+        NodeRecord* sl = find_node_by_id(hb->hdr.src_id);
         if (!sl) return;
         bool was_dead = !sl->alive;
         sl->alive      = true;
-        sl->last_hb_ms = millis();
+        sl->last_heartbeat_ms = millis();
         sl->item_count = hb->item_count;
         sl->capacity   = hb->capacity;
         sl->load_pct   = hb->load_pct;
         if (was_dead) {
             Serial.printf("[MASTER] Slave 0x%02X ONLINE\n", sl->id);
-            // Reset stale state if the slave came back with leftover RAM.
             if (hb->load_pct != 0) {
                 sl->alive = false;
-                uint8_t idx = (uint8_t)(sl - g_slaves);
-                if (send_hard_reset(idx)) {
+                uint8_t idx = (uint8_t)(sl - node_registry);
+                if (transmit_hard_reset(idx)) {
                     sl->alive = true;
                     Serial.printf("[MASTER] Slave 0x%02X reset OK\n", sl->id);
                 } else {
                     Serial.printf("[MASTER] Slave 0x%02X reset FAILED\n", sl->id);
                 }
             }
-            // New-node-join may have created an imbalance — flag for the loop.
             g_rebalance_pending = true;
         } else if (sl->alive) {
             if (hb->load_pct > REBALANCE_THRESHOLD) {
@@ -539,9 +595,9 @@ void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
             } else if (NUM_SLAVES >= 2) {
                 uint8_t hi = 0, lo = 101;
                 for (uint8_t i = 0; i < NUM_SLAVES; i++) {
-                    if (!g_slaves[i].alive) continue;
-                    if (g_slaves[i].load_pct > hi) hi = g_slaves[i].load_pct;
-                    if (g_slaves[i].load_pct < lo) lo = g_slaves[i].load_pct;
+                    if (!node_registry[i].alive) continue;
+                    if (node_registry[i].load_pct > hi) hi = node_registry[i].load_pct;
+                    if (node_registry[i].load_pct < lo) lo = node_registry[i].load_pct;
                 }
                 if (hi - lo >= IMBALANCE_THRESHOLD) g_rebalance_pending = true;
             }
@@ -549,7 +605,9 @@ void on_recv(const uint8_t* mac, const uint8_t* data, int len) {
     }
 }
 
-// ── Arduino entry points ───────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Arduino entry points
+// ════════════════════════════════════════════════════════════════════════════
 
 void setup() {
     Serial.begin(115200);
@@ -561,30 +619,29 @@ void setup() {
     transport_init(on_recv);
 
     for (uint8_t i = 0; i < NUM_SLAVES; i++) {
-        g_slaves[i].id          = (uint8_t)(i + 1);
-        g_slaves[i].mac         = SLAVE_MACS[i];
-        g_slaves[i].alive       = true;
-        g_slaves[i].last_hb_ms  = millis();
-        g_slaves[i].item_count  = 0;
-        g_slaves[i].capacity    = LOCAL_CAPACITY * 4;
-        g_slaves[i].load_pct    = 0;
+        node_registry[i].id          = (uint8_t)(i + 1);
+        node_registry[i].mac        = SLAVE_MACS[i];
+        node_registry[i].alive      = true;
+        node_registry[i].last_heartbeat_ms = millis();
+        node_registry[i].item_count     = 0;
+        node_registry[i].capacity   = LOCAL_CAPACITY * 4;
+        node_registry[i].load_pct  = 0;
         transport_add_peer(SLAVE_MACS[i]);
     }
 
-    routing_init();
+    assign_buckets_to_nodes();
     Serial.println("[MASTER] Ready. Commands: i/d/l <key> | s | b/f <n> | r");
 }
 
 void loop() {
     uint32_t now = millis();
     for (uint8_t i = 0; i < NUM_SLAVES; i++) {
-        if (g_slaves[i].alive && (now - g_slaves[i].last_hb_ms) > HEARTBEAT_TIMEOUT_MS) {
-            g_slaves[i].alive = false;
-            Serial.printf("[MASTER] Slave 0x%02X OFFLINE\n", g_slaves[i].id);
+        if (node_registry[i].alive && (now - node_registry[i].last_heartbeat_ms) > HEARTBEAT_TIMEOUT_MS) {
+            node_registry[i].alive = false;
+            Serial.printf("[MASTER] Slave 0x%02X OFFLINE\n", node_registry[i].id);
         }
     }
 
-    // Auto-rebalance (cooldown-gated). Runs in loop() — never inside on_recv.
     if (g_rebalance_pending && (now - g_last_rebalance_ms) >= REBALANCE_COOLDOWN_MS) {
         g_rebalance_pending = false;
         g_last_rebalance_ms = now;

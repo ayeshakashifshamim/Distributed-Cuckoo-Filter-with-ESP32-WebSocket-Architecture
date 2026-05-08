@@ -1,8 +1,9 @@
 #pragma once
 // dispatcher.h — Slave-side message handler.
-// The dispatcher is decoupled from the transport (tests inject a fake send_fn)
-// and from the single-node CuckooFilter class. All distributed state lives in
-// slave_storage.{h,cpp}; the local CuckooFilter is only used by unit tests.
+//
+// Decoupled from transport (tests inject a fake send_fn) and from the local
+// CuckooFilter class (which is only used by unit tests).  All distributed
+// state lives in slave_storage; this class only routes and serialises replies.
 
 #include <stdint.h>
 #include <stddef.h>
@@ -11,7 +12,7 @@
 
 typedef void (*TransportSendFn)(const uint8_t* data, size_t len);
 
-// Ring buffer of recently processed (src_id, seq) tuples so that retried
+// Ring buffer of recently processed (src_id, seq, op_id) tuples so that retried
 // requests (dropped ACKs) replay the cached reply instead of being re-executed.
 static constexpr uint8_t DEDUP_SIZE = 64;
 
@@ -19,7 +20,7 @@ struct DedupEntry {
     uint16_t src_id;
     uint8_t  seq;
     uint8_t  status;
-    uint8_t  evicted_tag;   // cached for MSG_CHAIN_RESULT retries
+    uint8_t  evicted_tag;
     uint32_t op_id;         // chain-insert correlator; 0 for other messages
     bool     valid;
 };
@@ -53,17 +54,16 @@ private:
     void _sendAck(uint8_t ack_seq, uint8_t status);
     void _sendChainResult(uint8_t ack_seq, uint8_t status, uint8_t evicted_tag);
 
-    // op_id=0 is the "no correlator" value used for non-chain messages.
     bool _dedupHit(uint16_t src_id, uint8_t seq, uint32_t op_id,
-                   uint8_t& status, uint8_t& evicted);
+                   uint8_t& status, uint8_t& evicted) const;
     void _dedupRecord(uint16_t src_id, uint8_t seq, uint32_t op_id,
                       uint8_t status, uint8_t evicted);
 
-    void _handleChainInsert(const MsgChainInsert* msg);
-    void _handleTagLookup(const MsgTagQuery* msg);
-    void _handleTagDelete(const MsgTagQuery* msg);
-    void _handleBucketBatchRead(const MsgBucketBatchRead* msg);
-    void _handleBucketBatchWrite(const MsgBucketBatchWrite* msg);
-    void _handleBucketBatchClear(const MsgBucketBatchClear* msg);
-    void _handleHardReset(const MsgHardReset* msg);
+    void process_cuckoo_insert(const MsgChainInsert* msg);
+    void process_bucket_lookup(const MsgTagQuery* msg);
+    void process_bucket_delete(const MsgTagQuery* msg);
+    void process_bucket_read(const MsgBucketBatchRead* msg);
+    void process_bucket_write(const MsgBucketBatchWrite* msg);
+    void process_bucket_clear(const MsgBucketBatchClear* msg);
+    void process_hard_reset(const MsgHardReset* msg);
 };
