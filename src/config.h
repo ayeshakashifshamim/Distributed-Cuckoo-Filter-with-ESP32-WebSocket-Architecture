@@ -7,7 +7,7 @@
 
 // ── Node IDs ──────────────────────────────────────────────────────────────────
 #define MASTER_ID   0x0000
-#define NUM_SLAVES  1      // must be a power of 2 (1, 2, 4, or 8)
+#define NUM_SLAVES  4      // must be a power of 2 (1, 2, 4, or 8)
 
 // ── MAC addresses ─────────────────────────────────────────────────────────────
 // Replace with real MACs before flashing. Print WiFi.macAddress() on each board.
